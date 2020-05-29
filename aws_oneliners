@@ -1,0 +1,54 @@
+# scan vpc classic load balancers
+# (I had to manually compile the inventory from DNS entries with A records not pointing to VPC load balancers)
+# greps for literal ".crt" or "443" in ALL files (not just configs) under known web servers for slimware classic elbs.
+# there's a mix of web server types, as well as .cnf vs .conf vs .CONF, etc... so this is a wide net by design.
+
+for i in $(cat inventories/classic-lbs); do echo "$i:" && ssh -t $i 'sudo grep -Ir  -E "\.crt|443" /etc/httpd/ /etc/nginx/ /etc/scalr'; done > ../classic.lb.ssl.certs
+
+# follow up: since some httpd servers have the logs dir symlinked under /etc/httpd/logs the grep will also scan all the logs. maybe refactoring with find to only get files
+# and not symlinks, and then piping each found file through grep would be better. I just let it run then carved out all the fluff with some grep -v's
+
+cat classic.lb.ssl.certs  | grep -v "/etc/httpd/logs" | grep -v "/etc/httpd/run/" | grep -v "/httpd/bak" | grep -v "Binary" | grep -v "\#" | grep -v "bak" > classic.lbs.ssl.data
+
+
+#AWS CLI + jq patterns
+
+#Just the private IP, Public IP and Public DNS of runnin instances whose private IP's contain 10.152
+ aws ec2 describe-instances --no-paginate --filter "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[].{Private:PrivateIpAddress,PublicDNS:PublicDnsName,PublicIP:PublicIpAddress}' | jq '.[] | select( .Private | contains("10.152"))'
+
+#Just the private IP, Public IP and Public DNS of runnin instances whose private IP's DON'T contain 10.152
+ aws ec2 describe-instances --no-paginate --filter "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[].{Private:PrivateIpAddress,PublicDNS:PublicDnsName,PublicIP:PublicIpAddress}' | jq '.[] | select( .Private | contains("10.10") | not )'
+
+# Maybe better, uses the AWS JMESPath syntax via --query to get all IP's that DON'T START with 10.152
+# (Remove the '| not' for inverse)
+aws ec2 describe-instances --no-paginate --filter "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[].{Private:PrivateIpAddress,PublicDNS:PublicDnsName,PublicIP:PublicIpAddress}' | jq '.[] | select( .Private | startswith("10.152") | not)'
+
+#Same thing with AWS's --query syntax - change `false` to `true` for inversion
+ aws ec2 describe-instances --no-paginate --filter "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[?starts_with(PrivateIpAddress, `10.152.`) == `false`]' | jq '.[] | .[] | {PrivateIpAddress, PublicIpAddress, PublicDnsName}'
+
+#Security groups in the VPC that are allowing port 22 access
+aws ec2 describe-security-groups --filters Name=ip-permission.from-port,Values=22 Name=ip-permission.to-port,Values=22 Name=vpc-id,Values=vpc-6af83f0f --query 'SecurityGroups[].{GID:GroupId,IPRanges:IpPermissions[].IpRanges}'
+
+# Running EC2 Classic instances, returns only public dns address and root key
+ aws ec2 describe-instances --no-paginate --filter "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[?starts_with(PrivateIpAddress, `10.152.`) == `false`]' | jq '.[] | .[] | {PublicDnsName, KeyName}' | jq -r ".[] "
+
+#Instance ID's from a list of AMI ID's (jq parses out the first hit so we only get one instance id per ami)
+do aws ec2 describe-instances --filter "Name=image-id,Values=$ami" --query 'Reservations[].Instances[].{InstanceId:InstanceId}' | jq '[.[]|select(.InstanceId)][0]' | jq -r '.InstanceId'
+
+# Returns all launch configuration names that have been created for this AWS account
+aws autoscaling describe-launch-configurations | jq '.LaunchConfigurations[].LaunchConfigurationName' | sed s/\"//g
+
+# Returns all active launch configurations names that are currently associated with running instances
+aws autoscaling describe-auto-scaling-instances | jq '.LaunchConfigurations[].LaunchConfigurationName' | sed s/\"//g
+
+# Returns all active launch configuration names that are currently associated with launch configuration groups
+aws autoscaling describe-auto-scaling-groups | jq '.LaunchConfigurations[].LaunchConfigurationName' | sed s/\"//g
+
+# Deletes all launch configuration specified in inventory file within the loop
+for i in $(cat inv); do aws autoscaling delete-launch-configuration --launch-configuration-name $i; done
+
+#another try at getting EC2 Classic instances - works using the fact that they have a null value for VPC ID
+aws ec2 describe-instances --output text --query 'Reservations[*].Instances[? VpcId == ""].[InstanceId,ImageId,Tags[*],PublicIpAddress,PublicDnsName] | []'
+
+# Returns list of all available Databases in AWS
+aws rds describe-db-instances --output text --query 'DBInstances[*].{DBInstanceIdentifier:DBInstanceIdentifier,InstanceCreateTime:InstanceCreateTime,DBInstanceStatus:DBInstanceStatus}' | grep available
